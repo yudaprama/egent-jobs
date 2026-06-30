@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivermigrate"
 	"github.com/riverqueue/river/rivertype"
 
 	"egent-jobs/asynctask"
@@ -51,19 +52,39 @@ type Client struct {
 
 // New constructs a River client, opens the pgx pool, and (optionally) runs
 // the River schema migrations. It does NOT start the client — call Start.
+//
+// Workers must be fully populated before this call (the bundle is a snapshot,
+// not live-mutable). When worker constructors need the pool (the common case),
+// use NewPool + NewWithPool instead:
+//
+//	pool, err := queue.NewPool(ctx, dsn)
+//	// build workers with pool, river.AddWorker(workers, ...)
+//	q, err := queue.NewWithPool(ctx, pool, queue.Options{Workers: workers, ...})
 func New(ctx context.Context, opts Options) (*Client, error) {
 	if opts.DSN == "" {
 		return nil, fmt.Errorf("queue: DSN is required")
 	}
-	if opts.Workers == nil {
-		return nil, fmt.Errorf("queue: Workers is required")
+	pool, err := NewPool(ctx, opts.DSN)
+	if err != nil {
+		return nil, err
 	}
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
+	c, err := NewWithPool(ctx, pool, opts)
+	if err != nil {
+		pool.Close()
+		return nil, err
 	}
+	return c, nil
+}
 
-	pool, err := pgxpool.New(ctx, opts.DSN)
+// NewPool opens the pgx pool and runs the pgvector extension probe, without
+// creating a River client. Use it when worker constructors need the pool at
+// build time. The caller owns the pool's lifetime (Close it when done, or hand
+// it to NewWithPool which closes it on Stop).
+func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("queue: DSN is required")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("queue: create pool: %w", err)
 	}
@@ -73,6 +94,23 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	if err := assertExtensions(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
+	}
+	return pool, nil
+}
+
+// NewWithPool builds the River client over an existing pool + workers bundle.
+// Use after NewPool so worker constructors can take the pool. The Client
+// closes the pool on Stop.
+func NewWithPool(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Client, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("queue: pool is required")
+	}
+	if opts.Workers == nil {
+		return nil, fmt.Errorf("queue: Workers is required")
+	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	queues := opts.Queues
@@ -93,7 +131,6 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		MaxAttempts: maxAttempts,
 	})
 	if err != nil {
-		pool.Close()
 		return nil, fmt.Errorf("queue: create river client: %w", err)
 	}
 
@@ -107,10 +144,19 @@ func (c *Client) MigrateSchema(_ context.Context, _ bool) error {
 	return nil
 }
 
-// Start starts the client. Set migrate=true to let River auto-run its
-// schema migration against the shared pool on startup.
+// Start starts the client. Set migrate=true to let River run its schema
+// migration (creates river_* tables in the target DB) before starting.
 func (c *Client) Start(ctx context.Context, migrate bool) error {
-	_ = migrate // River v0.39 performs schema migration via config; left as a hook
+	if migrate {
+		migrator, err := rivermigrate.New(riverpgxv5.New(c.Pool), nil)
+		if err != nil {
+			return fmt.Errorf("queue: create migrator: %w", err)
+		}
+		if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{}); err != nil {
+			return fmt.Errorf("queue: river migrate up: %w", err)
+		}
+		c.logger.Info("river schema migration applied")
+	}
 	return c.Client.Start(ctx)
 }
 

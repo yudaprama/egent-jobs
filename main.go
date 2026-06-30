@@ -11,7 +11,7 @@
 //
 // Configuration:
 //
-//	LOBEHUB_PG_DSN             — Supabase DSN to the lobehub database (required)
+//	KAWAI_PG_DSN               — Supabase DSN to the kawai database (required)
 //	OPENAI_API_KEY / MODEL_API_KEY — embedder bearer token (required for file_ingest)
 //	OPENAI_EMBEDDINGS_URL      — OpenAI-compatible base URL (default https://api.openai.com/v1)
 //	OPENAI_EMBEDDINGS_MODEL    — model id (default text-embedding-3-small)
@@ -83,9 +83,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dsn := os.Getenv("LOBEHUB_PG_DSN")
+	dsn := os.Getenv("KAWAI_PG_DSN")
 	if dsn == "" {
-		log.Error("LOBEHUB_PG_DSN is required")
+		log.Error("KAWAI_PG_DSN is required")
 		os.Exit(1)
 	}
 	log.Info("egent-jobs starting", "version", version, "dsn", queue.SanitizeDSN(dsn))
@@ -107,29 +107,31 @@ func main() {
 	batchSize := envInt("EMBEDDING_BATCH_SIZE", 10)
 	concurrency := envInt("EMBEDDING_CONCURRENCY", 3)
 
-	// Create the queue client first so we can hand the pool to the workers.
-	q, err := queue.New(ctx, queue.Options{
-		DSN: dsn,
-		Queues: map[string]river.QueueConfig{
-			asynctask.QueueFileIngest: {MaxWorkers: maxWorkers},
-			// Declared up front so producers can enqueue media jobs before
-			// the Go image/video workers ship. The queue simply won't drain
-			// them until a worker is registered.
-			asynctask.QueueMediaGen: {MaxWorkers: 4},
-			asynctask.QueueRagEval:   {MaxWorkers: 10},
-			asynctask.QueueMemoryIngest: {MaxWorkers: 2},
-			asynctask.QueuePersonaRefresh: {MaxWorkers: 1},
-		},
-		Logger: log,
-	})
+	// Open the pgx pool first so worker constructors can take it. River
+	// workers are registered into the bundle, then the client is built over
+	// the same pool via NewWithPool (workers must be populated before the
+	// River client is constructed).
+	pool, err := queue.NewPool(ctx, dsn)
 	if err != nil {
-		log.Error("create river client failed", "error", err)
+		log.Error("open pool failed", "error", err)
 		os.Exit(1)
 	}
+	defer pool.Close()
 
-	store := asynctask.NewStore(q.Pool)
+	queues := map[string]river.QueueConfig{
+		asynctask.QueueFileIngest: {MaxWorkers: maxWorkers},
+		// Declared up front so producers can enqueue media jobs before
+		// the Go image/video workers ship. The queue simply won't drain
+		// them until a worker is registered.
+		asynctask.QueueMediaGen:       {MaxWorkers: 4},
+		asynctask.QueueRagEval:        {MaxWorkers: 10},
+		asynctask.QueueMemoryIngest:   {MaxWorkers: 2},
+		asynctask.QueuePersonaRefresh: {MaxWorkers: 1},
+	}
+
+	store := asynctask.NewStore(pool)
 	river.AddWorker(workers, fileingest.NewEmbedFileChunksWorker(fileingest.WorkerConfig{
-		Pool:        q.Pool,
+		Pool:        pool,
 		Store:       store,
 		Embedder:    embedder,
 		Logger:      log,
@@ -137,24 +139,24 @@ func main() {
 		Concurrency: concurrency,
 	}))
 	river.AddWorker(workers, fileingest.NewParseFileToChunksWorker(fileingest.ParseWorkerConfig{
-		Pool:    q.Pool,
+		Pool:    pool,
 		Store:   store,
 		Fetcher: &fileingest.HTTPFetcher{},
 		Chunker: &fileingest.TextChunker{},
 		Logger:  log,
 	}))
 	river.AddWorker(workers, mediagen.NewImageGenerationWorker(mediagen.ImageWorkerConfig{
-		Pool:   q.Pool,
+		Pool:   pool,
 		Store:  store,
 		Logger: log,
 	}))
 	river.AddWorker(workers, mediagen.NewVideoGenerationWorker(mediagen.VideoWorkerConfig{
-		Pool:   q.Pool,
+		Pool:   pool,
 		Store:  store,
 		Logger: log,
 	}))
 	river.AddWorker(workers, rageval.NewRagEvalWorker(rageval.Config{
-		Pool:     q.Pool,
+		Pool:     pool,
 		Store:    store,
 		Embedder: embedder,
 		Logger:   log,
@@ -174,16 +176,16 @@ func main() {
 		ingestEmbedder = embedder
 	}
 	river.AddWorker(workers, memoryingest.NewIngestWorker(memoryingest.Config{
-		Pool:     q.Pool,
-		Store:    memoryingest.NewPgIngestStore(q.Pool, ingestEmbedder),
+		Pool:     pool,
+		Store:    memoryingest.NewPgIngestStore(pool, ingestEmbedder),
 		LLM:      llmClient,
 		Embedder: ingestEmbedder,
 		Logger:   log,
 	}))
 
-	personaStore := memoryingest.NewPgPersonaStore(q.Pool)
+	personaStore := memoryingest.NewPgPersonaStore(pool)
 	river.AddWorker(workers, memoryingest.NewPersonaWorker(memoryingest.PersonaConfig{
-		Pool:   q.Pool,
+		Pool:   pool,
 		Store:  personaStore,
 		LLM:    llmClient,
 		Logger: log,
@@ -204,6 +206,19 @@ func main() {
 	)
 
 	migrate := envBool("EGENT_JOBS_MIGRATE", true)
+
+	// Build the River client over the pool now that all workers are registered.
+	// The workers bundle is a snapshot passed at construction (not live-mutable).
+	q, err := queue.NewWithPool(ctx, pool, queue.Options{
+		Workers: workers,
+		Queues:  queues,
+		Logger:  log,
+	})
+	if err != nil {
+		log.Error("create river client failed", "error", err)
+		os.Exit(1)
+	}
+
 	if err := q.Start(ctx, migrate); err != nil {
 		log.Error("start river client failed", "error", err)
 		os.Exit(1)

@@ -22,7 +22,7 @@ Postgres-native — no Redis for jobs — so it reuses the existing Supabase poo
 ## Run
 
 ```bash
-export LOBEHUB_PG_DSN='postgres://...@host:5432/lobehub'
+export KAWAI_PG_DSN='postgres://...@host:5432/kawai'
 export OPENAI_API_KEY=sk-...
 # optional:
 #   OPENAI_EMBEDDINGS_MODEL=text-embedding-3-small
